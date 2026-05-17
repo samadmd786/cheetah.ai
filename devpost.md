@@ -41,5 +41,5 @@ One of the key features is that the system will work across virtually any open-s
 
 ### What We Learned
 
-We also learned that using Snowflake's Cortex AI directly inside the data platform drastically simplifies building real-time observability. By bringing the LLM to the data instead of moving data out to an LLM, we were able to instantly transform raw logs into human-readable narratives of our pipeline's performance.
+We learned that using Snowflake's Cortex AI directly inside the data platform drastically simplifies building real-time observability. By bringing the LLM to the data instead of moving data out to an LLM, we were able to instantly transform raw logs into human-readable narratives of our pipeline's performance.
 
