@@ -1,0 +1,8 @@
+vllm-mlx
+openai
+tiktoken
+pyyaml
+streamlit
+altair
+pandas
+snowflake-connector-python

@@ -3,13 +3,15 @@
 Design points (CLAUDE.md §5):
   * `log(event_type, **fields)` is the single entrypoint. Callers never await.
   * CSV is the always-on real sink — the dashboard reads it live.
-  * Snowflake is wired behind the same interface as a no-op stub by default.
-    Setting CLAUDE_TELEMETRY_SNOWFLAKE=1 (and providing real credentials in
-    SNOWFLAKE_*) would activate a real writer; for the hackathon we keep the
-    stub because the §8a gate ("kill Snowflake → CSV fallback works
-    transparently") is met by design when CSV is the always-on path.
+  * Snowflake is an optional second sink. Enable by setting
+    CLAUDE_TELEMETRY_SNOWFLAKE=1 + the SNOWFLAKE_* env vars
+    (USER, PASSWORD, ACCOUNT, WAREHOUSE, DATABASE, SCHEMA, TABLE). On any
+    connect/write failure the writer marks itself disabled and CSV keeps
+    flowing — that is the live §8a "kill Snowflake → CSV fallback" gate.
   * Writes happen on a single background thread fed by a Queue. The hot path
     only `put_nowait()`s a dict.
+  * Snowflake writes are batched (default 16 events / 0.5 s) so we don't pay
+    a round-trip per event.
 
 Schema is wide and flat (one row per event, JSON-encoded extras):
 
@@ -95,17 +97,207 @@ class _CsvWriter:
 
 
 class _SnowflakeStub:
-    """No-op Snowflake writer. Replace with a real connector when creds exist.
+    """No-op Snowflake writer used when CLAUDE_TELEMETRY_SNOWFLAKE != 1.
 
-    The hackathon §8a gate ("kill Snowflake → CSV fallback works transparently")
-    is satisfied because CSV is the always-on path; a Snowflake outage here is
-    indistinguishable from the stub.
+    Kept so the hot path can always call `self._sf.write(...)` without
+    branching. When disabled, CSV is the only sink — which is also the
+    behavior after a real-writer failure (see `_SnowflakeWriter`).
     """
 
     enabled: bool = False
 
     def write(self, event: Event) -> None:  # noqa: ARG002
         return None
+
+    def write_batch(self, events: list[Event]) -> None:  # noqa: ARG002
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+# Columns in the Snowflake EVENTS table. Order matters: it must match the
+# INSERT statement below.
+_SF_COLUMNS: list[str] = [
+    "ts",
+    "run_id",
+    "mode",
+    "event_type",
+    "role",
+    "doc_id",
+    "fingerprint",
+    "ttft_s",
+    "total_s",
+    "n_output_tokens",
+    "cache_hit",
+    "prompt_chars",
+    "message",
+    "extra_json",
+]
+
+
+class _SnowflakeWriter:
+    """Real Snowflake sink. Batched, fail-soft, off the hot path.
+
+    On any exception during connect or write the writer flips `enabled = False`
+    and the drain thread stops trying — CSV continues uninterrupted. That is
+    the live demonstration of the §8a fallback gate.
+    """
+
+    enabled: bool = False
+
+    def __init__(
+        self,
+        *,
+        account: str,
+        user: str,
+        password: str,
+        warehouse: str,
+        database: str,
+        schema: str,
+        table: str = "EVENTS",
+        role: str | None = None,
+        authenticator: str | None = None,
+    ) -> None:
+        # Lazy import so the hard dep is only needed when SF is turned on.
+        import snowflake.connector
+
+        self._database = database
+        self._schema = schema
+        self._table = table
+        connect_kwargs: dict = dict(
+            account=account,
+            user=user,
+            warehouse=warehouse,
+            database=database,
+            schema=schema,
+            role=role,
+            client_session_keep_alive=True,
+        )
+        # MFA-required accounts use Programmatic Access Tokens (PATs). The
+        # connector wants the PAT in `token=`, not `password=`, when this
+        # authenticator is in play. For plain password auth it stays in
+        # `password=`.
+        if authenticator:
+            connect_kwargs["authenticator"] = authenticator
+        if authenticator and authenticator.upper() in (
+            "PROGRAMMATIC_ACCESS_TOKEN",
+            "OAUTH",
+        ):
+            connect_kwargs["token"] = password
+        else:
+            connect_kwargs["password"] = password
+        self._conn = snowflake.connector.connect(**connect_kwargs)
+        self._ensure_table()
+        self.enabled = True
+
+    @property
+    def fq_table(self) -> str:
+        return f'"{self._database}"."{self._schema}"."{self._table}"'
+
+    def _ensure_table(self) -> None:
+        ddl = f"""
+        CREATE TABLE IF NOT EXISTS {self.fq_table} (
+            ts            FLOAT,
+            run_id        STRING,
+            mode          STRING,
+            event_type    STRING,
+            role          STRING,
+            doc_id        STRING,
+            fingerprint   STRING,
+            ttft_s        FLOAT,
+            total_s       FLOAT,
+            n_output_tokens INTEGER,
+            cache_hit     BOOLEAN,
+            prompt_chars  INTEGER,
+            message       STRING,
+            extra_json    VARIANT
+        )
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(ddl)
+
+    @staticmethod
+    def _event_to_tuple(ev: Event) -> tuple:
+        return (
+            ev.ts,
+            ev.run_id,
+            ev.mode,
+            ev.event_type,
+            ev.role,
+            ev.doc_id,
+            ev.fingerprint,
+            ev.ttft_s,
+            ev.total_s,
+            ev.n_output_tokens,
+            ev.cache_hit,
+            ev.prompt_chars,
+            ev.message,
+            json.dumps(ev.extra, default=str) if ev.extra else None,
+        )
+
+    def write(self, event: Event) -> None:
+        self.write_batch([event])
+
+    def write_batch(self, events: list[Event]) -> None:
+        if not events:
+            return
+        # VARIANT can't be bound directly; we PARSE_JSON the bound STRING.
+        placeholders = (
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))"
+        )
+        sql = (
+            f"INSERT INTO {self.fq_table} "
+            f"({', '.join(_SF_COLUMNS)}) "
+            f"SELECT column1, column2, column3, column4, column5, column6, "
+            f"column7, column8, column9, column10, column11, column12, "
+            f"column13, PARSE_JSON(column14) "
+            f"FROM VALUES "
+            + ", ".join(["(" + ", ".join(["%s"] * 14) + ")"] * len(events))
+        )
+        params: list = []
+        for ev in events:
+            params.extend(self._event_to_tuple(ev))
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _build_snowflake_writer() -> _SnowflakeStub | _SnowflakeWriter:
+    """Construct a real writer from env vars, or a stub on failure / disabled."""
+    if os.environ.get("CLAUDE_TELEMETRY_SNOWFLAKE") != "1":
+        return _SnowflakeStub()
+    required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD"]
+    missing = [k for k in required if not os.environ.get(k)]
+    if missing:
+        print(
+            f"[telemetry] Snowflake disabled: missing env vars {missing}",
+            flush=True,
+        )
+        return _SnowflakeStub()
+    try:
+        return _SnowflakeWriter(
+            account=os.environ["SNOWFLAKE_ACCOUNT"],
+            user=os.environ["SNOWFLAKE_USER"],
+            password=os.environ["SNOWFLAKE_PASSWORD"],
+            warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+            database=os.environ.get("SNOWFLAKE_DATABASE", "BRIDGE_DB"),
+            schema=os.environ.get("SNOWFLAKE_SCHEMA", "TELEMETRY"),
+            table=os.environ.get("SNOWFLAKE_TABLE", "EVENTS"),
+            role=os.environ.get("SNOWFLAKE_ROLE") or None,
+            authenticator=os.environ.get("SNOWFLAKE_AUTHENTICATOR") or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[telemetry] Snowflake connect failed, falling back to CSV-only: {exc}",
+            flush=True,
+        )
+        return _SnowflakeStub()
 
 
 class Telemetry:
@@ -122,14 +314,19 @@ class Telemetry:
         csv_path: Path | str = DEFAULT_CSV,
         run_id: str | None = None,
         snowflake_enabled: bool | None = None,
+        sf_batch_max: int = 16,
+        sf_flush_interval_s: float = 0.5,
     ) -> None:
         self.run_id = run_id or uuid.uuid4().hex[:8]
         self._csv = _CsvWriter(Path(csv_path))
-        sf_env = os.environ.get("CLAUDE_TELEMETRY_SNOWFLAKE") == "1"
-        self._sf = _SnowflakeStub()
-        self._sf.enabled = (
-            snowflake_enabled if snowflake_enabled is not None else sf_env
-        )
+        # If caller passes snowflake_enabled=False explicitly, force the stub
+        # (used by the offline fallback gate). Otherwise honor env config.
+        if snowflake_enabled is False:
+            self._sf: _SnowflakeStub | _SnowflakeWriter = _SnowflakeStub()
+        else:
+            self._sf = _build_snowflake_writer()
+        self._sf_batch_max = sf_batch_max
+        self._sf_flush_interval_s = sf_flush_interval_s
         self._queue: "queue.Queue[Event | None]" = queue.Queue(maxsize=1024)
         self._worker = threading.Thread(
             target=self._drain, name="telemetry", daemon=True
@@ -158,25 +355,50 @@ class Telemetry:
         """Flush pending events, then stop the worker."""
         self._queue.put(None)
         self._worker.join(timeout=timeout)
+        self._sf.close()
+
+    def _flush_sf_batch(self, batch: list[Event]) -> None:
+        if not batch or not self._sf.enabled:
+            return
+        try:
+            self._sf.write_batch(batch)
+        except Exception as exc:  # noqa: BLE001
+            # CSV already has the rows; Snowflake failure is non-fatal.
+            # Disable further attempts this session — the §8a fallback gate.
+            print(
+                f"[telemetry] Snowflake write failed, falling back to CSV-only: {exc}",
+                flush=True,
+            )
+            self._sf.enabled = False
 
     def _drain(self) -> None:
+        batch: list[Event] = []
+        last_flush = time.time()
         while True:
-            event = self._queue.get()
+            timeout = self._sf_flush_interval_s if self._sf.enabled else None
+            try:
+                event = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                self._flush_sf_batch(batch)
+                batch = []
+                last_flush = time.time()
+                continue
             if event is None:
+                self._flush_sf_batch(batch)
                 return
             try:
                 self._csv.write(event)
             except Exception as exc:  # noqa: BLE001
                 print(f"[telemetry] CSV write failed: {exc}", flush=True)
             if self._sf.enabled:
-                try:
-                    self._sf.write(event)
-                except Exception as exc:  # noqa: BLE001
-                    # CSV already has the row; Snowflake failure is non-fatal.
-                    print(
-                        f"[telemetry] Snowflake write failed (fallback to CSV): {exc}",
-                        flush=True,
-                    )
+                batch.append(event)
+                if (
+                    len(batch) >= self._sf_batch_max
+                    or (time.time() - last_flush) >= self._sf_flush_interval_s
+                ):
+                    self._flush_sf_batch(batch)
+                    batch = []
+                    last_flush = time.time()
 
 
 # Convenience for reading rows back (used by tests and the dashboard).

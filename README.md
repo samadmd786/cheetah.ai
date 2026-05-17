@@ -39,6 +39,25 @@ not just what was used last. Same KV cache underneath, unchanged.
 
 ---
 
+## Key Benefits
+
+- **Eliminate the "Amnesia Tax"**: Agents no longer waste time and compute re-reading the same foundational document.
+- **Dramatically Lower TTFT (Time To First Token)**: Downstream agents see up to a **70x speedup** (e.g., from 35s to 0.5s) because their required context is pre-loaded.
+- **Zero Redundant Processing**: The orchestrator absorbs the cold prefill *between* agent calls, keeping the multi-agent pipeline feeling snappy and interactive.
+- **Save Expensive GPU Cycles**: By sharing KV cache prefixes intelligently, you reduce redundant token processing, freeing up GPU bandwidth for actual inference.
+
+---
+
+## Snowflake: The Analytics & AI Layer
+
+This project goes beyond just running inference by turning **Snowflake** into the active analytics and AI backbone of the control plane:
+
+- **Live Telemetry Sink**: Every event, decision, and cache hit is streamed asynchronously into `BRIDGE_DB.TELEMETRY.EVENTS` using `snowflake-connector-python`.
+- **Cortex AI Run Narrator**: We use Snowflake Cortex (`llama3.1-70b`) directly within the database to read the orchestrator's decision log and automatically generate a judge-ready, natural-language summary of how the pipeline performed.
+- **Dynamic Tables Leaderboard**: A Snowflake Dynamic Table (`RUN_SUMMARY`) incrementally aggregates pipeline performance (TTFT, GPU-seconds saved, cache hit rate) in real-time without needing external schedulers like Airflow.
+
+---
+
 ## Architecture
 
 ```
@@ -58,9 +77,10 @@ orchestrator.py     ← observe → lookahead → act → adapt
         ↓
 vllm-mlx (8001)     ← unchanged: native prefix cache does the actual reuse
         ↓
-telemetry.py        ← non-blocking CSV writer (Snowflake stub behind same iface)
+telemetry.py        ← non-blocking CSV writer + live Snowflake sink
         ↓
 dashboard/app.py    ← Streamlit (port 8502): live charts, decision log, hot-doc timeline
+                       (Snowflake Cortex AI run narrator + Dynamic Tables leaderboard)
 ```
 
 Modules, each kept deliberately small:
@@ -71,7 +91,7 @@ Modules, each kept deliberately small:
 | [bridge.py](bridge.py)       | the only OpenAI seam; fingerprint, dispatch, `keep_resident` |
 | [orchestrator.py](orchestrator.py) | reads manifest, lookahead warmups, SimHash check, LRU |
 | [simhash.py](simhash.py)     | 64-bit SimHash on 3-word shingles + Hamming distance |
-| [telemetry.py](telemetry.py) | non-blocking CSV-primary sink + Snowflake stub |
+| [telemetry.py](telemetry.py) | non-blocking CSV sink + live Snowflake writer (`BRIDGE_DB.TELEMETRY.EVENTS`) |
 | [run.py](run.py)             | pipeline runner (multi-mode, multi-pipeline) |
 | [demo.py](demo.py)           | 2-stage live terminal demo with token streaming |
 | [dashboard/app.py](dashboard/app.py) | Streamlit dashboard |
@@ -87,7 +107,7 @@ Prereqs: Apple Silicon Mac, Python 3.12, ~6 GB free memory.
 # 1. Install (Python 3.12 only)
 brew install python@3.12
 /opt/homebrew/bin/python3.12 -m venv .venv
-.venv/bin/pip install vllm-mlx openai tiktoken pyyaml streamlit altair pandas
+.venv/bin/pip install -r requirements.txt
 
 # 2. Build the documents (~14k tokens each)
 .venv/bin/python scripts/build_discovery.py
@@ -136,7 +156,8 @@ vllm-mlx's simple engine has an MLX threading bug
 - Sequential 3-agent pipelines (`discovery_review`, `multi_doc_review`,
   `near_dup_check`).
 - Single-machine vllm-mlx on Apple Silicon (M4 Pro, 16 GB).
-- CSV-primary telemetry, Snowflake stub behind the same `log()` interface.
+- CSV telemetry + live Snowflake sink (async, batched).
+- Snowflake Cortex AI for run narration & Dynamic Tables for a live leaderboard.
 - Streamlit dashboard with live TTFT chart, hot-doc timeline, decision log,
   SimHash detail table.
 
