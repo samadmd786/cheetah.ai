@@ -24,17 +24,21 @@ pipelines:
     description: >-
       Phase 3 multi-document scenario. Three agents read three different
       docs, exercising both the orchestrator's budget-aware LRU eviction
-      (under a small `hot_capacity`) and the SimHash near-duplicate matcher
-      (the Auditor's doc is a perturbed copy of the Screener's doc, so the
-      orchestrator should log a `near_duplicate_detected` decision before
-      firing the keep-resident warmup for it).
+      (under a small `hot_capacity`) and the SimHash near-duplicate matcher.
+
+      Node order is deliberate: we start with `merger` so a back-to-back
+      Stage-2-then-Stage-3 demo doesn't inherit a warm Stage-2 cache
+      entry (Stage 2 uses `discovery`). The Auditor's `discovery` then
+      is a near-duplicate of the Analyst's `discovery_v3`, so the
+      orchestrator's `_check_near_duplicate` fires between Analyst and
+      Auditor, immediately before the keep-resident warmup for discovery.
     nodes:
       - role: Screener
-        doc_id: discovery
-      - role: Analyst
         doc_id: merger
-      - role: Auditor
+      - role: Analyst
         doc_id: discovery_v3
+      - role: Auditor
+        doc_id: discovery
 
   near_dup_check:
     description: >-

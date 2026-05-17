@@ -21,7 +21,7 @@ import hashlib
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from openai import OpenAI
 
@@ -135,6 +135,8 @@ class Bridge:
         max_tokens: int = 192,
         temperature: float = 0.0,
         cache_bust: str | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_first_token: Callable[[float], None] | None = None,
     ) -> DispatchResult:
         """Run one real agent call end-to-end. Notifies orchestrator first."""
         messages, heavy_block, _ = build_messages(
@@ -155,7 +157,11 @@ class Bridge:
             )
 
         ttft_s, total_s, n_tokens, text = self._stream_completion(
-            messages=messages, max_tokens=max_tokens, temperature=temperature
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            on_token=on_token,
+            on_first_token=on_first_token,
         )
         cache_hit = ttft_s < CACHE_MISS_TTFT_SECONDS
 
@@ -259,6 +265,8 @@ class Bridge:
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
+        on_token: Callable[[str], None] | None = None,
+        on_first_token: Callable[[float], None] | None = None,
     ) -> tuple[float, float, int, str]:
         t0 = time.perf_counter()
         stream = self.client.chat.completions.create(
@@ -274,6 +282,10 @@ class Bridge:
         for piece in _iter_text_chunks(stream):
             if ttft_s is None:
                 ttft_s = time.perf_counter() - t0
+                if on_first_token is not None:
+                    on_first_token(ttft_s)
+            if on_token is not None:
+                on_token(piece)
             chunks.append(piece)
             n += 1
         total_s = time.perf_counter() - t0
