@@ -40,7 +40,6 @@ Finally, integrating the live Snowflake telemetry without slowing down the hot i
 One of the key features is that the system will work across virtually any open-source model architecture. Depending on which model an agent uses, the runtime automatically selects and manages the appropriate KV cache format and attention implementation for that architecture. The orchestrator handles cache coordination between agent calls, ensuring cache creation and minimizing cache misses or unnecessary recomputation, so the user experiences a seamless low-latency workflow even when different agents or models are involved.
 
 ### What We Learned
-The biggest insight was that the workflow graph is the missing input. Serving engines are powerful but blind to intent. The moment you give the cache a lookahead - even one step - the problem changes completely. The cold prefill does not disappear; it just moves to where the user cannot feel it. 
 
 We also learned that using Snowflake's Cortex AI directly inside the data platform drastically simplifies building real-time observability. By bringing the LLM to the data instead of moving data out to an LLM, we were able to instantly transform raw logs into human-readable narratives of our pipeline's performance.
 
