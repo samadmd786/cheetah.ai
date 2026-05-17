@@ -1,0 +1,62 @@
+# Phase 2 workflow manifest — the hand-written DAG the orchestrator reads.
+#
+# Read this top-to-bottom: each pipeline is an ordered list of (role, doc_id).
+# The orchestrator uses `role + doc_id` lookahead to decide whether to fire a
+# `keep_resident` warmup before the next agent's call lands. There is no
+# inference about agent intent here — the dependency is *declared*, not learned.
+# That is the whole orchestration thesis (CLAUDE.md §2).
+
+pipelines:
+  discovery_review:
+    description: >-
+      Phase 1's three-agent contract review. All three agents read the same
+      ~13k-token discovery doc, so the heavy block is invariant across the
+      pipeline and a single shared prefix should serve all three calls.
+    nodes:
+      - role: Screener
+        doc_id: discovery
+      - role: Analyst
+        doc_id: discovery
+      - role: Auditor
+        doc_id: discovery
+
+  multi_doc_review:
+    description: >-
+      Phase 3 multi-document scenario. Three agents read three different
+      docs, exercising both the orchestrator's budget-aware LRU eviction
+      (under a small `hot_capacity`) and the SimHash near-duplicate matcher
+      (the Auditor's doc is a perturbed copy of the Screener's doc, so the
+      orchestrator should log a `near_duplicate_detected` decision before
+      firing the keep-resident warmup for it).
+    nodes:
+      - role: Screener
+        doc_id: discovery
+      - role: Analyst
+        doc_id: merger
+      - role: Auditor
+        doc_id: discovery_v3
+
+  near_dup_check:
+    description: >-
+      Minimal pipeline that ONLY exercises the SimHash near-duplicate path.
+      Two agents, two docs — the second is a perturbed copy of the first.
+    nodes:
+      - role: Screener
+        doc_id: discovery
+      - role: Auditor
+        doc_id: discovery_v3
+
+documents:
+  discovery:
+    path: data/discovery.txt
+    description: Litigation/discovery contract used by the Phase 1/2 demo.
+  merger:
+    path: data/merger.txt
+    description: M&A purchase agreement (Phase 3 multi-doc scenario).
+  discovery_v3:
+    path: data/discovery_v3.txt
+    description: >-
+      Near-duplicate of discovery.txt — same semantic content with whitespace
+      perturbed and a handful of dollar amounts changed. vllm-mlx's exact
+      prefix cache will MISS on this; SimHash distance to discovery is small
+      (Hamming = 1 / 64). Phase 3 robustness demo.
