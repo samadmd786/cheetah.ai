@@ -3,7 +3,7 @@
 A control plane on top of an existing KV cache (vllm-mlx) that reads a
 multi-agent workflow graph and **pre-warms the cache for the next agent
 before it asks** — eliminating the "amnesia tax" that multi-agent AI
-systems pay when every agent re-prefills the same documents from scratch.
+systems pay when every agent re-prefills the same documents from scratch
 
 Built in 24 hours for Uncommon Hacks 2026 (University of Chicago).
 🔗 **[View our Devpost Submission: Cheetah.ai](https://devpost.com/software/cheetah-ai?ref_content=my-projects-tab&ref_feature=my_projects)**
